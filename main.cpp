@@ -1,3 +1,5 @@
+#include <assert.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -12,14 +14,25 @@ template <typename T>
 concept Chunk = !
 std::is_same_v<std::decay_t<T>, std::monostate>;
 
-struct AnimationData {
-  float pre_loop_duration = 0.f;
-  float loop_duration = 0.f;
-  float post_loop_duration = 0.f;
-  float execute0 = 0.f;
-  float execute1 = 0.f;
-  float evade_duration = 0.f;
+struct Trigger {
+  uint32_t type;
+  uint32_t flags;
+  uint32_t time;
 };
+
+struct AnimationData {
+  uint32_t total_duration;
+  uint32_t pre_loop_duration;
+  uint32_t loop_duration;
+  uint32_t post_loop_duration;
+  uint32_t execute0;
+  uint32_t execute1;
+  uint32_t evade_duration;
+  std::vector<Trigger> triggers;
+};
+
+constexpr auto SequenceStepFlagsLoopBegin = (1 << 4);
+constexpr auto SequenceStepFlagsLoopEnd = (1 << 5);
 
 [[nodiscard]] AnimationData GetAnimationData(
     const Chunk auto chunk, uint64_t animation, uint64_t variant,
@@ -36,106 +49,147 @@ struct AnimationData {
                                          [variant](const auto &anim_data) {
                                            return anim_data.token == variant;
                                          });
-
     if (anim_data != sequence->animation_data.end()) {
-      size_t loop_begin_index = 0;
-      size_t loop_end_index = 0;
-      for (size_t i = 0; i < anim_data->steps.size(); i++) {
-        const auto &step = anim_data->steps[i];
-        if (step.flags & 0x10) {
-          loop_begin_index = i;
+      // If the animation has a loop try find the beginning and the end
+      size_t loop_begin_index{};
+      size_t loop_end_index{};
+      for (size_t loop_index{}; loop_index < anim_data->steps.size();
+           loop_index++) {
+        const auto &step = anim_data->steps[loop_index];
+        if (step.flags & SequenceStepFlagsLoopBegin) {
+          loop_begin_index = loop_index;
         }
-        if (step.flags & 0x20) {
-          loop_end_index = i + 1;
+        // A single step can be both, the beginning and the end of a loop
+        if (step.flags & SequenceStepFlagsLoopEnd) {
+          loop_end_index = loop_index + 1;
         }
       }
 
-      if (loop_begin_index != loop_end_index) {
-        auto step_count_a = 0;
-        auto step_count_b = 0;
-        for (size_t i = 0; i < anim_data->steps.size();) {
+      assert(loop_end_index >= loop_begin_index);
+      const bool has_loop = loop_begin_index != loop_end_index;
+
+      // Calculate how long a single loop iteration takes
+      uint32_t loop_single_duration{};
+      if (has_loop) {
+        for (size_t i = loop_begin_index; i < loop_end_index; i++) {
           const auto &step = anim_data->steps[i];
-          const auto duration =
-              (step.type == 0 ? step.action->duration : step.move->duration) /
-              1000.f;
-
-          if (step.flags & 0xf) {
-            result.evade_duration += duration;
-          }
-
-          if (i < loop_begin_index) {
-            result.pre_loop_duration += duration;
-          }
-
-          if (i >= loop_end_index) {
-            result.post_loop_duration += duration;
-          }
-
-          bool inside_loop = i >= loop_begin_index && i < loop_end_index;
-          if (inside_loop) {
-            if (step_count_a < std::get<0>(loop_step_count)) {
-              result.loop_duration += duration;
-              step_count_a++;
-            }
-            if (step_count_b < std::get<1>(loop_step_count)) {
-              step_count_b++;
-            }
-          }
-
-          // Skip to end
-          if (inside_loop && step_count_b == std::get<1>(loop_step_count)) {
-            i = loop_end_index;
-          } else {
-            if (i == (loop_end_index - 1)) {
-              i = loop_begin_index;
-            } else {
-              i++;
-            }
-          }
-        }
-      } else {
-        for (const auto &step : anim_data->steps) {
-          const auto duration =
-              (step.type == 0 ? step.action->duration : step.move->duration) /
-              1000.f;
-          if (step.flags & 0xf) {
-            result.evade_duration += duration;
-          }
-          result.pre_loop_duration += duration;
+          loop_single_duration +=
+              step.type == 0 ? step.action->duration : step.move->duration;
         }
       }
 
-      auto time = INFINITY;
-      auto time_end = 0.f;
+      size_t trigger_index{};
+      size_t trigger_begin_loop_index{};
+      uint32_t step_count_a{};
+      uint32_t step_count_b{};
+
+      for (size_t i = 0u; i < anim_data->steps.size();) {
+        const auto inside_loop =
+            has_loop ? i >= loop_begin_index && i < loop_end_index : false;
+
+        const auto &step = anim_data->steps[i];
+        const auto step_duration =
+            step.type == 0 ? step.action->duration : step.move->duration;
+        result.total_duration += step_duration;
+
+        if (step.flags & 0xf) {
+          result.evade_duration += step_duration;
+        }
+
+        if (i < loop_begin_index) {
+          result.pre_loop_duration += step_duration;
+        }
+
+        if (i >= loop_end_index) {
+          result.post_loop_duration += step_duration;
+        }
+
+        for (; trigger_index < anim_data->triggers.size();) {
+          const auto &trigger = anim_data->triggers[trigger_index];
+
+          auto time = trigger.time;
+          if (has_loop) {
+            // Adjust time if inside or after a loop
+            if (i >= loop_end_index) {
+              time += result.loop_duration - loop_single_duration;
+            } else if (inside_loop) {
+              time += (result.loop_duration / loop_single_duration) *
+                      loop_single_duration;
+            }
+          }
+
+          if (time > result.total_duration) {
+            break;
+          }
+
+          result.triggers.emplace_back(trigger.trigger, trigger.flags, time);
+          trigger_index++;
+        }
+
+        if (inside_loop) {
+          if (step_count_a < std::get<0>(loop_step_count)) {
+            result.loop_duration += step_duration;
+            step_count_a++;
+          }
+          if (step_count_b < std::get<1>(loop_step_count)) {
+            step_count_b++;
+          }
+        }
+
+        if (inside_loop && step_count_b == std::get<1>(loop_step_count)) {
+          i = loop_end_index;
+        } else {
+          if (i == (loop_end_index - 1)) {
+            i = loop_begin_index;
+            trigger_index = trigger_begin_loop_index;
+          } else {
+            i++;
+            if (i == loop_begin_index) {
+              trigger_begin_loop_index = trigger_index;
+            }
+          }
+        }
+      }
+
+      auto time_first_trigger = std::numeric_limits<uint32_t>::max();
+      auto time_last_trigger = std::numeric_limits<uint32_t>::max();
       for (auto &trigger : anim_data->triggers) {
         if (trigger.trigger == 3) {
-          time = std::min(time, trigger.time / 1000.f);
-          time_end = std::max(time_end, trigger.time / 1000.f);
+          if (time_first_trigger == std::numeric_limits<uint32_t>::max() ||
+              time_first_trigger > trigger.time) {
+            time_first_trigger = trigger.time;
+          }
+          if (time_last_trigger == std::numeric_limits<uint32_t>::max() ||
+              trigger.time > time_last_trigger) {
+            time_last_trigger = trigger.time;
+          }
         }
       }
 
-      auto fixed_loop_duration = 0.f;
+      uint32_t fixed_loop_duration{};
       for (size_t i = loop_begin_index; i < loop_end_index; i++) {
         const auto &step = anim_data->steps[i];
         fixed_loop_duration +=
-            (step.type == 0 ? step.action->duration : step.move->duration) /
-            1000.f;
+            step.type == 0 ? step.action->duration : step.move->duration;
       }
 
-      if (time <= (fixed_loop_duration + result.pre_loop_duration)) {
-        result.execute0 = time;
+      if (time_first_trigger <=
+          (fixed_loop_duration + result.pre_loop_duration)) {
+        result.execute0 = time_first_trigger;
       } else {
-        result.execute0 = (result.loop_duration - fixed_loop_duration) + time;
+        result.execute0 =
+            (result.loop_duration - fixed_loop_duration) + time_first_trigger;
       }
 
-      if (time_end < result.pre_loop_duration) {
-        result.execute1 = time_end;
+      if (time_last_trigger < result.pre_loop_duration) {
+        result.execute1 = time_last_trigger;
       } else {
         result.execute1 =
-            (result.loop_duration - fixed_loop_duration) + time_end;
+            (result.loop_duration - fixed_loop_duration) + time_last_trigger;
       }
     }
   }
+
   return result;
 }
 
@@ -197,12 +251,19 @@ int main(int argc, char *argv[]) {
         },
         *chunk);
 
+    std::cout << "total_duration: " << data.total_duration << std::endl;
     std::cout << "pre_loop_duration: " << data.pre_loop_duration << std::endl;
     std::cout << "loop_duration: " << data.loop_duration << std::endl;
     std::cout << "post_loop_duration: " << data.post_loop_duration << std::endl;
     std::cout << "execute0: " << data.execute0 << std::endl;
     std::cout << "execute1: " << data.execute1 << std::endl;
     std::cout << "evade_duration: " << data.evade_duration << std::endl;
+    std::cout << "triggers:" << std::endl;
+    for (const auto &trigger : data.triggers) {
+      std::cout << '\t' << "type: " << trigger.type
+                << " flags: " << trigger.flags << " time: " << trigger.time
+                << std::endl;
+    }
   }
 
   return 0;
