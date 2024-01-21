@@ -29,10 +29,26 @@ struct AnimationData {
   uint32_t execute1;
   uint32_t evade_duration;
   std::vector<Trigger> triggers;
+  uint32_t flags;
 };
 
+/*
+Extreme:
+Fly:
+Hop:
+Sidestep:
+*/
+
+constexpr auto SequenceStepFlagsEvadeExtreme = (1 << 0);
+constexpr auto SequenceStepFlagsEvadeFly = (1 << 1);
+constexpr auto SequenceStepFlagsEvadeHop = (1 << 2);
+constexpr auto SequenceStepFlagsEvadeSidestep = (1 << 3);
 constexpr auto SequenceStepFlagsLoopBegin = (1 << 4);
 constexpr auto SequenceStepFlagsLoopEnd = (1 << 5);
+
+constexpr auto SequenceStepFlagsEvadeAll =
+    SequenceStepFlagsEvadeExtreme | SequenceStepFlagsEvadeFly |
+    SequenceStepFlagsEvadeHop | SequenceStepFlagsEvadeSidestep;
 
 [[nodiscard]] AnimationData GetAnimationData(
     const Chunk auto chunk, uint64_t animation, uint64_t variant,
@@ -92,7 +108,7 @@ constexpr auto SequenceStepFlagsLoopEnd = (1 << 5);
             step.type == 0 ? step.action->duration : step.move->duration;
         result.total_duration += step_duration;
 
-        if (step.flags & 0xf) {
+        if (step.flags & SequenceStepFlagsEvadeAll) {
           result.evade_duration += step_duration;
         }
 
@@ -187,6 +203,8 @@ constexpr auto SequenceStepFlagsLoopEnd = (1 << 5);
         result.execute1 =
             (result.loop_duration - fixed_loop_duration) + time_last_trigger;
       }
+
+      result.flags = anim_data->flags;
     }
   }
 
@@ -264,6 +282,7 @@ int main(int argc, char *argv[]) {
                 << " flags: " << trigger.flags << " time: " << trigger.time
                 << std::endl;
     }
+    std::cout << "flags:" << data.flags << std::endl;
   }
 
   return 0;
